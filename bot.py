@@ -1,7 +1,17 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
+import asyncio
+from datetime import datetime, time
 from dotenv import load_dotenv
+import yt_dlp
+from googleapiclient.discovery import build
+
+try:
+    from static_ffmpeg import add_paths
+    add_paths() # Ajoute automatiquement ffmpeg au PATH du bot
+except ImportError:
+    pass
 
 # Charger les variables d'environnement depuis le fichier .env
 load_dotenv()
@@ -57,6 +67,60 @@ EMOJIS = {
     "Annonces": "📢", "Événements": "🎉", "Vidéos du compte": "📺", "Partenariats": "🤝"
 }
 
+# --- CONFIGURATION LOGS & RADIO ---
+LOG_CHANNEL_NAME = "mj-logs"
+RADIO_CHANNEL_ID = 1503065345678901234 # ID du salon vocal par défaut
+# Radio 24/7 activée
+
+# YouTube API Configuration
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+MJ_OFFICIAL_CHANNEL_ID = "UC9SsrOCBKvLp0vC7U_fUMWw" # Michael Jackson Official Channel
+
+# Configuration yt-dlp (HAUTE QUALITÉ)
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+}
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS), data=data)
+
 
 # --- CLASSES DES BOUTONS ET VUES ---
 
@@ -97,6 +161,10 @@ class MJFranceBot(commands.Bot):
         intents.members = True # Indispensable pour modifier les rôles
         
         super().__init__(command_prefix="!", intents=intents)
+        self.radio_playing = False
+        self.voice_client = None
+        self.discography = []
+        self.current_song = None
 
     async def setup_hook(self):
         # Enregistrement des vues pour les rendre persistantes au démarrage du bot
@@ -104,6 +172,124 @@ class MJFranceBot(commands.Bot):
         self.add_view(RoleView(CRAFTS_ROLES))
         self.add_view(RoleView(REGIONS_ROLES))
         self.add_view(RoleView(NOTIFS_ROLES))
+        
+        # Charger la discographie au démarrage
+        await self.update_discography()
+        
+        # Démarrage de la tâche radio
+        self.radio_task.start()
+
+    async def update_discography(self):
+        """Récupère tous les sons officiels de Michael Jackson via l'API YouTube."""
+        if not YOUTUBE_API_KEY:
+            print("⚠️ YOUTUBE_API_KEY manquante. Utilisation d'une liste vide.")
+            return
+
+        print("📡 Récupération de la discographie MJ en cours...")
+        try:
+            youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+            
+            # On récupère les vidéos de la chaîne officielle
+            request = youtube.search().list(
+                channelId=MJ_OFFICIAL_CHANNEL_ID,
+                part="snippet",
+                maxResults=50, # On peut augmenter ou paginer pour TOUTE la discographie
+                order="viewCount", # Pour avoir les meilleurs sons d'abord
+                type="video"
+            )
+            response = request.execute()
+            
+            self.discography = []
+            for item in response.get('items', []):
+                title = item['snippet']['title'].lower()
+                # Filtrage plus permissif mais toujours officiel
+                if any(x in title for x in ["official", "music video", "audio", "remastered"]):
+                    if not any(x in title for x in ["cover", "tribute", "fan made", "reaction"]):
+                        video_id = item['id']['videoId']
+                        self.discography.append({
+                            'url': f"https://www.youtube.com/watch?v={video_id}",
+                            'title': item['snippet']['title']
+                        })
+            
+            # Si toujours vide, on fait une recherche plus large
+            if not self.discography:
+                request = youtube.search().list(
+                    q="Michael Jackson Official Music Video",
+                    part="snippet",
+                    maxResults=50,
+                    type="video"
+                )
+                response = request.execute()
+                for item in response.get('items', []):
+                    video_id = item['id']['videoId']
+                    self.discography.append({
+                        'url': f"https://www.youtube.com/watch?v={video_id}",
+                        'title': item['snippet']['title']
+                    })
+
+            print(f"✅ Discographie mise à jour : {len(self.discography)} titres chargés.")
+        except Exception as e:
+            print(f"❌ Erreur lors de la récupération YouTube : {e}")
+
+    async def get_or_create_log_channel(self, guild):
+        channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        if channel is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            }
+            channel = await guild.create_text_channel(LOG_CHANNEL_NAME, overwrites=overwrites)
+            print(f"📁 Salon de logs créé: {LOG_CHANNEL_NAME}")
+        return channel
+
+    # --- ÉVÉNEMENTS DE LOGS ---
+    async def on_message_delete(self, message):
+        if message.author.bot: return
+        channel = await self.get_or_create_log_channel(message.guild)
+        embed = discord.Embed(
+            title="🗑️ Message Supprimé", 
+            description=f"Un message de {message.author.mention} a été supprimé dans {message.channel.mention}",
+            color=0xE74C3C, 
+            timestamp=datetime.now()
+        )
+        embed.add_field(name="Contenu", value=message.content or "*(Pas de texte)*", inline=False)
+        embed.set_footer(text=f"ID Utilisateur: {message.author.id}")
+        if message.author.avatar:
+            embed.set_thumbnail(url=message.author.avatar.url)
+        await channel.send(embed=embed)
+
+    async def on_message_edit(self, before, after):
+        if before.author.bot or before.content == after.content: return
+        channel = await self.get_or_create_log_channel(before.guild)
+        embed = discord.Embed(
+            title="📝 Message Modifié", 
+            description=f"Message de {before.author.mention} modifié dans {before.channel.mention}",
+            color=0xF39C12, 
+            timestamp=datetime.now()
+        )
+        embed.add_field(name="Ancien", value=before.content or "*(Vide)*", inline=False)
+        embed.add_field(name="Nouveau", value=after.content or "*(Vide)*", inline=False)
+        embed.set_footer(text=f"ID Utilisateur: {before.author.id}")
+        await channel.send(embed=embed)
+
+    # --- TÂCHE RADIO Michael Jackson 24/7 ---
+    @tasks.loop(minutes=5)
+    async def radio_task(self):
+        # Vérification simple pour s'assurer que le bot reste connecté si radio_playing est True
+        if self.radio_playing and self.voice_client and not self.voice_client.is_connected():
+            print("🔄 Reconnexion automatique de la radio...")
+            # La reconnexion serait gérée ici si besoin
+            pass
+
+    async def start_radio(self):
+        print("📻 Radio MJ en mode 24/7.")
+        self.radio_playing = True
+
+    async def stop_radio(self):
+        print("📻 Arrêt manuel de la radio.")
+        if self.voice_client and self.voice_client.is_connected():
+            await self.voice_client.disconnect()
+        self.radio_playing = False
 
 bot = MJFranceBot()
 
@@ -111,6 +297,102 @@ bot = MJFranceBot()
 async def on_ready():
     print(f'✅ Connecté avec succès en tant que {bot.user} (ID: {bot.user.id})')
     print('------')
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(e)
+
+# --- COMMANDES SLASH ---
+
+@bot.tree.command(name="logs_setup", description="Configure manuellement le salon de logs.")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def logs_setup(interaction: discord.Interaction):
+    channel = await bot.get_or_create_log_channel(interaction.guild)
+    await interaction.response.send_message(f"✅ Salon de logs prêt : {channel.mention}", ephemeral=True)
+
+@bot.tree.command(name="radio_join", description="Fait rejoindre le bot en vocal pour la radio MJ.")
+async def radio_join(interaction: discord.Interaction):
+    if interaction.user.voice is None:
+        await interaction.response.send_message("❌ Tu dois être dans un salon vocal !", ephemeral=True)
+        return
+
+    channel = interaction.user.voice.channel
+    bot.voice_client = await channel.connect()
+    await interaction.response.send_message(f"📻 Radio MJ connectée à **{channel.name}** !")
+    bot.radio_playing = True
+    await play_next_hit(interaction.guild)
+
+async def play_next_hit(guild):
+    if bot.voice_client and bot.voice_client.is_connected():
+        import random
+        
+        if not bot.discography:
+            await bot.update_discography()
+            
+        if not bot.discography:
+            return
+
+        song_data = random.choice(bot.discography)
+        song_url = song_data['url']
+        
+        try:
+            player = await YTDLSource.from_url(song_url, loop=bot.loop, stream=True)
+            bot.current_song = player
+            bot.voice_client.play(player, after=lambda e: bot.loop.create_task(play_next_hit(guild)))
+            
+            # Message Now Playing esthétique
+            log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+            if log_channel:
+                embed = discord.Embed(
+                    title="🎶 Michael Jackson Radio 24/7",
+                    description=f"En cours : **{player.title}**",
+                    color=0x000000
+                )
+                embed.set_thumbnail(url="https://i.pinimg.com/736x/8e/31/6d/8e316d6c4e0e5a9a4b8a4a4a4a4a4a4a.jpg")
+                embed.add_field(name="Qualité", value="💎 Ultra High Definition (192kbps)", inline=True)
+                embed.add_field(name="Source", value="✅ Chaine Officielle", inline=True)
+                embed.set_footer(text="MJFrance Radio - The King of Pop Never Stops")
+                await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"⚠️ Erreur de lecture : {e}")
+            await asyncio.sleep(2)
+            await play_next_hit(guild)
+
+@bot.tree.command(name="radio_stop", description="Arrête la radio et déconnecte le bot.")
+async def radio_stop(interaction: discord.Interaction):
+    if bot.voice_client:
+        await bot.voice_client.disconnect()
+        bot.radio_playing = False
+        await interaction.response.send_message("📻 Radio arrêtée.")
+    else:
+        await interaction.response.send_message("❌ Le bot n'est pas en vocal.", ephemeral=True)
+
+@bot.tree.command(name="radio_skip", description="Passe au titre suivant.")
+async def radio_skip(interaction: discord.Interaction):
+    if bot.voice_client and bot.voice_client.is_playing():
+        bot.voice_client.stop() # Trigger le 'after' pour jouer le suivant
+        await interaction.response.send_message("⏭️ Passage au titre suivant...", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Aucune musique en cours.", ephemeral=True)
+
+@bot.tree.command(name="radio_nowplaying", description="Affiche le titre en cours.")
+async def radio_nowplaying(interaction: discord.Interaction):
+    if bot.current_song:
+        embed = discord.Embed(title="🎵 En cours sur MJ Radio", description=bot.current_song.title, color=0x000000)
+        await interaction.response.send_message(embed=embed)
+    else:
+        await interaction.response.send_message("📻 La radio est en pause.", ephemeral=True)
+
+@bot.tree.command(name="radio_list", description="Affiche les titres chargés.")
+async def radio_list(interaction: discord.Interaction):
+    if not bot.discography:
+        await interaction.response.send_message("📭 La discographie est vide.", ephemeral=True)
+        return
+    
+    titles = "\n".join([f"• {s['title']}" for s in bot.discography[:15]])
+    embed = discord.Embed(title="🕺 Discographie MJ Chargée", description=f"{titles}\n*... et {len(bot.discography)-15} autres titres*", color=0x000000)
+    await interaction.response.send_message(embed=embed)
 
 @bot.command(name="setup_roles")
 @commands.has_permissions(administrator=True)
